@@ -1,0 +1,50 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    commands:
+      - echo "Installing Flyway ${FW_VERSION} and the psql client"
+      - curl -sSL "https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/${FW_VERSION}/flyway-commandline-${FW_VERSION}-linux-x64.tar.gz" | tar -xz -C /opt
+      - ln -sf "/opt/flyway-${FW_VERSION}/flyway" /usr/local/bin/flyway
+      - dnf install -y -q postgresql16 || dnf install -y -q postgresql15
+      - flyway --version
+
+  pre_build:
+    commands:
+      - echo "Target databases -> ${TARGET_DBS}"
+      - |
+        if [ "${TAKE_SNAPSHOT}" = "true" ]; then
+          SNAP_ID="pre-migration-$(date +%Y%m%d-%H%M%S)"
+          echo "Taking snapshot ${SNAP_ID} ..."
+          aws rds create-db-snapshot --db-instance-identifier "${DB_INSTANCE_ID}" --db-snapshot-identifier "${SNAP_ID}" > /dev/null
+          aws rds wait db-snapshot-available --db-snapshot-identifier "${SNAP_ID}"
+          echo "Snapshot ${SNAP_ID} is ready"
+        else
+          echo "Snapshot skipped (TAKE_SNAPSHOT=${TAKE_SNAPSHOT})"
+        fi
+
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        export PGPASSWORD="${DB_PASSWORD}"
+        export FLYWAY_USER="${DB_USER}"
+        export FLYWAY_PASSWORD="${DB_PASSWORD}"
+        ADMIN_CONN="host=${DB_HOST} port=5432 user=${DB_USER} dbname=postgres sslmode=require"
+        for DB in ${TARGET_DBS}; do
+          echo "==================== ${DB} ===================="
+          if [ ! -d "migrations/${DB}" ]; then
+            echo "ERROR: folder migrations/${DB} does not exist"; exit 1
+          fi
+          if [ "$(psql "${ADMIN_CONN}" -tAc "SELECT 1 FROM pg_database WHERE datname='${DB}'")" != "1" ]; then
+            echo "Database ${DB} does not exist yet - creating it"
+            psql "${ADMIN_CONN}" -c "CREATE DATABASE \"${DB}\""
+          fi
+          export FLYWAY_URL="jdbc:postgresql://${DB_HOST}:5432/${DB}?sslmode=require"
+          export FLYWAY_LOCATIONS="filesystem:migrations/${DB}"
+          flyway -connectRetries=3 "${DB_ACTION}"
+          flyway info
+        done
