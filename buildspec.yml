@@ -16,6 +16,12 @@ phases:
     commands:
       - echo "Target databases -> ${TARGET_DBS}"
       - |
+        # Safe credential self-check (never prints the values)
+        echo "DB_USER length: ${#DB_USER} | DB_PASSWORD length: ${#DB_PASSWORD}"
+        case "${DB_USER}"     in \{*) echo "PROBLEM: DB_USER is the whole JSON - add :username";; arn:*) echo "PROBLEM: DB_USER is ARN text - set type to Secrets Manager";; esac
+        case "${DB_PASSWORD}" in \{*) echo "PROBLEM: DB_PASSWORD is the whole JSON - add :password";; arn:*) echo "PROBLEM: DB_PASSWORD is ARN text - set type to Secrets Manager";; esac
+        if [ "${DB_USER}" = "${DB_PASSWORD}" ]; then echo "PROBLEM: DB_USER and DB_PASSWORD are identical - check :username / :password"; fi
+      - |
         if [ "${TAKE_SNAPSHOT}" = "true" ]; then
           SNAP_ID="pre-migration-$(date +%Y%m%d-%H%M%S)"
           echo "Taking snapshot ${SNAP_ID} ..."
@@ -39,7 +45,8 @@ phases:
           if [ ! -d "migrations/${DB}" ]; then
             echo "ERROR: folder migrations/${DB} does not exist"; exit 1
           fi
-          if [ "$(psql "${ADMIN_CONN}" -tAc "SELECT 1 FROM pg_database WHERE datname='${DB}'")" != "1" ]; then
+          EXISTS=$(psql "${ADMIN_CONN}" -tAc "SELECT 1 FROM pg_database WHERE datname='${DB}'")
+          if [ "${EXISTS}" != "1" ]; then
             echo "Database ${DB} does not exist yet - creating it"
             psql "${ADMIN_CONN}" -c "CREATE DATABASE \"${DB}\""
           fi
