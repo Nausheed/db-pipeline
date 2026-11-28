@@ -12,3 +12,4 @@ CREATE TABLE orders (
     status       VARCHAR(20) DEFAULT 'NEW',
     created_at   TIMESTAMP DEFAULT NOW()
 );
+-- sneaky edit to an applied file
