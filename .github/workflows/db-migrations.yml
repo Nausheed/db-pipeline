@@ -1,0 +1,124 @@
+name: DB Migrations
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['migrations/**']
+  push:
+    branches: [main]
+    paths: ['migrations/**']
+  workflow_dispatch:
+    inputs:
+      databases:
+        description: 'Space-separated DB folders to migrate'
+        required: true
+        default: 'orders_db billing_db'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-migrations      # never run two migrations at the same time
+  cancel-in-progress: false
+
+jobs:
+  # ---------- Runs on every PR: rule checks, no DB access ----------
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check migration rules
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          CHANGES=$(git diff --name-status "$BASE_SHA" HEAD -- migrations/)
+          echo "Changed migration files:"
+          echo "$CHANGES"
+          FAIL=0
+
+          while IFS=$'\t' read -r STATUS FILE REST; do
+            [ -z "${STATUS:-}" ] && continue
+            if [ "$STATUS" != "A" ]; then
+              echo "::error file=$FILE::Existing migration files must never be edited, renamed or deleted. Add a new V<n>__ file instead."
+              FAIL=1
+              continue
+            fi
+            if ! [[ "$FILE" =~ ^migrations/[a-z0-9_]+/V[0-9]+__[A-Za-z0-9_]+\.sql$ ]]; then
+              echo "::error file=$FILE::Bad file name. Use migrations/<db_name>/V<number>__<description>.sql"
+              FAIL=1
+            fi
+          done <<< "$CHANGES"
+
+          for DIR in migrations/*/; do
+            DUPES=$(ls "$DIR" | grep -oE '^V[0-9]+' | sort | uniq -d || true)
+            if [ -n "$DUPES" ]; then
+              echo "::error::Duplicate version number(s) in $DIR: $DUPES"
+              FAIL=1
+            fi
+          done
+
+          DBS=$(echo "$CHANGES" | awk -F'\t' '{print $NF}' | cut -d/ -f2 | sort -u | tr '\n' ' ')
+          echo "### Databases affected by this PR: ${DBS}" >> "$GITHUB_STEP_SUMMARY"
+          exit $FAIL
+
+  # ---------- On merge to main: work out which DBs changed ----------
+  detect:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      dbs: ${{ steps.find.outputs.dbs }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: find
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_DBS: ${{ github.event.inputs.databases }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            DBS="$INPUT_DBS"
+          elif [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            DBS=$(ls -d migrations/*/ | cut -d/ -f2 | tr '\n' ' ')
+          else
+            DBS=$(git diff --name-only "$BEFORE" "$AFTER" -- migrations/ | cut -d/ -f2 | sort -u | tr '\n' ' ')
+          fi
+          DBS=$(echo $DBS)
+          echo "Databases to migrate: '${DBS}'"
+          echo "dbs=${DBS}" >> "$GITHUB_OUTPUT"
+          echo "### Databases to migrate: ${DBS:-none}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------- Approval gate, then run CodeBuild ----------
+  migrate:
+    needs: detect
+    if: needs.detect.outputs.dbs != ''
+    runs-on: ubuntu-latest
+    environment: production          # <- pauses here until a reviewer approves
+    permissions:
+      id-token: write                # needed for OIDC
+      contents: read
+    env:
+      TARGET_DBS: ${{ needs.detect.outputs.dbs }}
+      TAKE_SNAPSHOT: ${{ vars.TAKE_SNAPSHOT || 'false' }}
+    steps:
+      - name: Get temporary AWS credentials (OIDC - no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Run Flyway in CodeBuild (inside the VPC)
+        uses: aws-actions/aws-codebuild-run-build@v1
+        with:
+          project-name: db-pipeline-migrations
+          source-version-override: ${{ github.sha }}
+          env-vars-for-codebuild: TARGET_DBS,TAKE_SNAPSHOT
